@@ -361,8 +361,12 @@ class ProjectIndexer:
                 normalized = rel_path.replace(os.sep, "/")
 
                 # Check if file matches any include pattern
+                # fnmatch doesn't handle ** like glob — "**/*.py" won't
+                # match "main.py" (root-level files). Try both the original
+                # pattern and a stripped version without the **/ prefix.
                 if not any(
                     fnmatch.fnmatch(normalized, pat)
+                    or fnmatch.fnmatch(normalized, pat.replace("**/", "", 1))
                     for pat in self.include_patterns
                 ):
                     continue
