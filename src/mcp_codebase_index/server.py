@@ -242,11 +242,9 @@ def _build_index() -> None:
     _query_fns = create_project_query_functions(index)
     print("[mcp-codebase-index] Query functions created", file=sys.stderr, flush=True)
 
-    if not _is_git:
-        _is_git = is_git_repo(_project_root)
-    if _is_git:
-        index.last_indexed_git_ref = get_head_commit(_project_root)
-        _save_cache(index)
+    # Skip git subprocess calls on Windows (corrupts asyncio stdio pipes).
+    # Save cache unconditionally without git ref validation.
+    _save_cache(index)
 
     print(
         f"[mcp-codebase-index] Indexed {index.total_files} files, "
