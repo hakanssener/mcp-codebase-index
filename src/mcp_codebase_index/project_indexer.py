@@ -336,29 +336,60 @@ class ProjectIndexer:
     # ------------------------------------------------------------------
 
     def _discover_files(self) -> list[str]:
-        """Discover files matching include patterns, excluding exclude patterns."""
-        root = Path(self.root_path)
+        """Discover files matching include patterns, excluding exclude patterns.
+
+        Uses os.walk with early directory pruning instead of pathlib.glob
+        to avoid following junctions/symlinks and walking into .git/ etc.
+        """
         matched: set[str] = set()
 
-        for pattern in self.include_patterns:
-            for p in root.glob(pattern):
-                if p.is_file():
-                    abs_str = str(p)
-                    rel_str = os.path.relpath(abs_str, self.root_path)
+        # Extract simple directory names from exclude patterns for early pruning
+        prune_dirs = {".git", "__pycache__", "node_modules", ".venv", "venv"}
+        for pattern in self.exclude_patterns:
+            clean = pattern.replace("**/", "").replace("/**", "").strip("/")
+            if "/" not in clean and "*" not in clean:
+                prune_dirs.add(clean)
 
-                    if self._is_excluded(rel_str):
-                        continue
+        # Single walk pass, prune excluded dirs in-place, no symlink following
+        for dirpath, dirs, filenames in os.walk(self.root_path, followlinks=False):
+            # Prune directories in-place so os.walk doesn't descend into them
+            dirs[:] = [d for d in dirs if d not in prune_dirs]
 
-                    # Check file size
-                    try:
-                        size = p.stat().st_size
-                    except OSError:
-                        continue
-                    if size > self.max_file_size_bytes:
-                        logger.debug("Skipping %s (size %d > %d)", rel_str, size, self.max_file_size_bytes)
-                        continue
+            for fname in filenames:
+                abs_path = os.path.join(dirpath, fname)
+                rel_path = os.path.relpath(abs_path, self.root_path)
+                normalized = rel_path.replace(os.sep, "/")
 
-                    matched.add(abs_str)
+                # Check if file matches any include pattern
+                # fnmatch doesn't handle ** like glob — "**/*.py" won't
+                # match "main.py" (root-level files). Try both the original
+                # pattern and a stripped version without the **/ prefix.
+                if not any(
+                    fnmatch.fnmatch(normalized, pat)
+                    or fnmatch.fnmatch(normalized, pat.replace("**/", "", 1))
+                    for pat in self.include_patterns
+                ):
+                    continue
+
+                # Check exclude patterns
+                if self._is_excluded(rel_path):
+                    continue
+
+                # Check file size
+                try:
+                    size = os.path.getsize(abs_path)
+                except OSError:
+                    continue
+                if size > self.max_file_size_bytes:
+                    logger.debug(
+                        "Skipping %s (size %d > %d)",
+                        rel_path,
+                        size,
+                        self.max_file_size_bytes,
+                    )
+                    continue
+
+                matched.add(abs_path)
 
         return sorted(matched)
 

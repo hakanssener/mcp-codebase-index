@@ -28,6 +28,7 @@ Usage:
 
 from __future__ import annotations
 
+import asyncio
 import fnmatch
 import json
 import os
@@ -42,7 +43,6 @@ from mcp.types import Tool, TextContent
 import mcp.types as types
 
 from mcp_codebase_index.git_tracker import is_git_repo, get_head_commit, get_changed_files
-from mcp_codebase_index.models import ProjectIndex
 from mcp_codebase_index.project_indexer import ProjectIndexer
 from mcp_codebase_index.query_api import create_project_query_functions
 
@@ -202,56 +202,27 @@ def _load_cache(project_root: str) -> "ProjectIndex | None":
 
 
 def _ensure_index() -> None:
-    """Build the project index on first use (lazy initialization).
-
-    Tries to load from a pickle cache first. If the cache is valid and
-    the git ref matches (or the changeset is small enough for incremental
-    update), skips a full rebuild.
-
-    This is called on the first tool call rather than at startup so that
-    the MCP server can complete its initialization handshake immediately.
-    Without this, large projects would cause Claude Code to timeout waiting
-    for the server to become ready.
-    """
+    """Build the project index on first use (lazy initialization)."""
     global _project_root, _indexer, _query_fns, _is_git
 
     if _indexer is not None:
         return
 
+    print("[mcp-codebase-index] _ensure_index: starting...", file=sys.stderr, flush=True)
     _project_root = os.environ.get("PROJECT_ROOT", os.getcwd())
-    _is_git = is_git_repo(_project_root)
 
+    # Try cache first (skip git validation to avoid subprocess.run
+    # which can corrupt asyncio stdio pipes on Windows)
+    print("[mcp-codebase-index] _ensure_index: loading cache...", file=sys.stderr, flush=True)
     cached_index = _load_cache(_project_root)
-    if cached_index is not None and _is_git and cached_index.last_indexed_git_ref:
-        current_head = get_head_commit(_project_root)
-        if current_head == cached_index.last_indexed_git_ref:
-            # Exact match — use cache directly
-            print("[mcp-codebase-index] Cache hit (git ref matches)", file=sys.stderr)
-            _indexer = ProjectIndexer(_project_root)
-            _indexer._project_index = cached_index
-            _query_fns = create_project_query_functions(cached_index)
-            return
+    if cached_index is not None:
+        print("[mcp-codebase-index] Cache hit, using cached index", file=sys.stderr, flush=True)
+        _indexer = ProjectIndexer(_project_root)
+        _indexer._project_index = cached_index
+        _query_fns = create_project_query_functions(cached_index)
+        return
 
-        # Check if changeset is small enough for incremental update on cache
-        changeset = get_changed_files(_project_root, cached_index.last_indexed_git_ref)
-        total_changes = len(changeset.modified) + len(changeset.added) + len(changeset.deleted)
-        if not changeset.is_empty and total_changes <= 20:
-            print(
-                f"[mcp-codebase-index] Cache hit with {total_changes} changed files, "
-                f"applying incremental update",
-                file=sys.stderr,
-            )
-            _indexer = ProjectIndexer(_project_root)
-            _indexer._project_index = cached_index
-            _query_fns = create_project_query_functions(cached_index)
-            # _maybe_incremental_update will handle the rest on first tool call
-            return
-
-        print(
-            f"[mcp-codebase-index] Cache stale ({total_changes} changes), full rebuild",
-            file=sys.stderr,
-        )
-
+    print("[mcp-codebase-index] No cache, building fresh index...", file=sys.stderr, flush=True)
     _build_index()
 
 
@@ -261,17 +232,19 @@ def _build_index() -> None:
 
     if not _project_root:
         _project_root = os.environ.get("PROJECT_ROOT", os.getcwd())
-    print(f"[mcp-codebase-index] Indexing project: {_project_root}", file=sys.stderr)
+    print(f"[mcp-codebase-index] Indexing project: {_project_root}", file=sys.stderr, flush=True)
 
+    print("[mcp-codebase-index] Creating ProjectIndexer...", file=sys.stderr, flush=True)
     _indexer = ProjectIndexer(_project_root)
+    print("[mcp-codebase-index] Running index()...", file=sys.stderr, flush=True)
     index = _indexer.index()
+    print(f"[mcp-codebase-index] index() returned: {index.total_files} files", file=sys.stderr, flush=True)
     _query_fns = create_project_query_functions(index)
+    print("[mcp-codebase-index] Query functions created", file=sys.stderr, flush=True)
 
-    if not _is_git:
-        _is_git = is_git_repo(_project_root)
-    if _is_git:
-        index.last_indexed_git_ref = get_head_commit(_project_root)
-        _save_cache(index)
+    # Skip git subprocess calls on Windows (corrupts asyncio stdio pipes).
+    # Save cache unconditionally without git ref validation.
+    _save_cache(index)
 
     print(
         f"[mcp-codebase-index] Indexed {index.total_files} files, "
@@ -280,6 +253,7 @@ def _build_index() -> None:
         f"{index.total_classes} classes "
         f"in {index.index_build_time_seconds:.2f}s",
         file=sys.stderr,
+        flush=True,
     )
 
 
@@ -663,7 +637,7 @@ async def list_tools() -> list[Tool]:
 async def call_tool(name: str, arguments: dict) -> list[types.TextContent]:
     global _query_fns, _total_chars_returned
 
-    # Track tool call counts (including reindex/stats themselves)
+    # Track tool call counts
     _tool_call_counts[name] = _tool_call_counts.get(name, 0) + 1
 
     try:
@@ -778,7 +752,7 @@ async def call_tool(name: str, arguments: dict) -> list[types.TextContent]:
 
     except Exception as e:
         tb = traceback.format_exc()
-        print(f"[mcp-codebase-index] Error in {name}: {tb}", file=sys.stderr)
+        print(f"[mcp-codebase-index] Error in {name}: {tb}", file=sys.stderr, flush=True)
         return [TextContent(type="text", text=f"Error: {e}")]
 
 
